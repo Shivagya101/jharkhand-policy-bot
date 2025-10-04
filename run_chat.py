@@ -15,6 +15,7 @@ except Exception:
     # read variables from the actual environment.
     print("python-dotenv not available; relying on environment variables")
     pass
+from langchain.storage import create_kv_docstore
 from typing import List, TypedDict, Annotated, Sequence
 from langchain_huggingface import HuggingFaceEndpoint, HuggingFaceEmbeddings, ChatHuggingFace
 from langchain_core.prompts import PromptTemplate
@@ -23,6 +24,11 @@ from langchain_core.documents import Document
 from langchain_core.pydantic_v1 import BaseModel, Field
 from langgraph.graph import StateGraph, END
 import operator
+from langchain.storage import LocalFileStore
+from langchain.storage._lc_store import create_lc_store
+from langchain.retrievers import ParentDocumentRetriever
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+
 
 # Global counter for how many times the LLM is called.
 llm_call_count = 0
@@ -40,9 +46,9 @@ def invoke_chain(chain, payload: dict):
 
 # --- Configuration (No changes here) ---
 HF_TOKEN = os.environ.get("HUGGINGFACEHUB_API_TOKEN") or os.environ.get("HF_TOKEN")
-REPO_ID = "mistralai/Mistral-7B-Instruct-v0.3"
+REPO_ID = "Qwen/Qwen2-7B-Instruct"
 DB_FAISS_PATH = "vector_store/db_faiss"
-EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+EMBED_MODEL = "l3cube-pune/indic-sentence-similarity-sbert"
 # --- IMPORTANT: Add the path to your PDF data for the retriever setup ---
 DATA_PATH = "data/" 
 
@@ -59,23 +65,38 @@ def load_chat_model() -> ChatHuggingFace:
         max_new_tokens=512,
     )
     return ChatHuggingFace(llm=endpoint)
+# You'll need this new import at the top of your file
+
 
 def get_retriever():
     """
-    Loads the FAISS vector store and returns a retriever.
-    This function now assumes the ParentDocumentRetriever setup was used.
+    Loads the FAISS vector store (child embeddings)
+    and the saved parent docstore to reconstruct the ParentDocumentRetriever.
     """
+    # ✅ Step 1: Load your embedding model
     embeddings = HuggingFaceEmbeddings(model_name=EMBED_MODEL)
-    # For this example, we load the FAISS index created by the previous script.
-    # In a real application, you would also persist and load the 'docstore'.
-    # Since the docstore was in-memory, we can't load it directly.
-    # The ParentDocumentRetriever is best used when loaded and passed around,
-    # but for this script, we'll use the child-chunk retriever directly.
-    # The logic in the graph will handle fetching the full context.
-    db = FAISS.load_local(DB_FAISS_PATH, embeddings, allow_dangerous_deserialization=True)
-    return db.as_retriever(search_kwargs={"k": 3})
 
-# --- LangGraph Agent Definition ---
+    # ✅ Step 2: Load FAISS index (child embeddings)
+    db = FAISS.load_local(DB_FAISS_PATH, embeddings, allow_dangerous_deserialization=True)
+
+    # ✅ Step 3: Load saved parent docstore (created in create_database.py)
+    DOCSTORE_PATH = "vector_store/parent_store"
+    fs = LocalFileStore(DOCSTORE_PATH)
+    store = create_lc_store(fs)
+
+    # ✅ Step 4: Use the same splitters as used during database creation
+    parent_splitter = RecursiveCharacterTextSplitter(chunk_size=1500, chunk_overlap=70)
+    child_splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=40)
+    # ✅ Step 5: Rebuild the ParentDocumentRetriever
+    retriever = ParentDocumentRetriever(
+        vectorstore=db,
+        docstore=store,
+        parent_splitter=parent_splitter,
+        child_splitter=child_splitter,
+    )
+
+    print("Retriever loaded successfully.")
+    return retriever
 
 # 1. Define the State
 # The state is the "memory" of our agent. It's a dictionary that gets passed between nodes.
@@ -155,7 +176,7 @@ def generate(state):
     print("---NODE: GENERATE---")
     question = state["question"]
     documents = state["documents"]
-    
+    print(documents)
     prompt = PromptTemplate(
         template=CUSTOM_PROMPT, input_variables=["context", "question"]
     )
@@ -163,7 +184,6 @@ def generate(state):
     rag_chain = prompt | llm
     generation = invoke_chain(rag_chain, {"context": documents, "question": question})
     # Ensure we return the text content when available
-    print(f"Generation response: {getattr(generation, 'content', str(generation))}")
     return {"generation": getattr(generation, "content", str(generation))}
 
 def rewrite_query(state):
