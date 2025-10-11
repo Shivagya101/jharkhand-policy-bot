@@ -1,4 +1,12 @@
 import os
+import pymongo
+from dotenv import load_dotenv
+from mongo_docstore import MongoDocStore
+
+
+load_dotenv()
+
+
 from langchain_community.document_loaders import TextLoader, DirectoryLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_huggingface import HuggingFaceEmbeddings
@@ -7,6 +15,7 @@ from langchain.storage import LocalFileStore
 from langchain.retrievers import ParentDocumentRetriever
 from langchain_community.docstore.in_memory import InMemoryDocstore
 import faiss # Use the direct faiss import
+
 
 # --- NEW IMPORT: The key to solving the error ---
 from langchain.storage import create_kv_docstore
@@ -34,16 +43,24 @@ def load_text_files(data_path):
 
 def get_retriever(vectorstore, documents):
     """
-    Initializes the ParentDocumentRetriever with a parent-child splitting strategy.
+    Initializes the ParentDocumentRetriever with MongoDB as the docstore,
+    using a connection URI from the environment file.
     """
-    # Recommendation: Consider larger parent chunks for more context
     parent_splitter = RecursiveCharacterTextSplitter(chunk_size=1500, chunk_overlap=70)
     child_splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=40)
+
     # --- MODIFICATION START ---
-    # 1. Create the low-level file store
-    fs = LocalFileStore(DOCSTORE_PATH)
-    # 2. Wrap it with create_kv_docstore to handle Document object serialization
-    store = create_kv_docstore(fs)
+    # 1. Get the MongoDB URI from environment variables
+    mongo_uri = os.getenv("MONGO_DB_URI")
+    if not mongo_uri:
+        raise ValueError("MONGO_DB_URI not found in environment variables. Check your .env file.")
+
+    # 2. Connect to your MongoDB database and collection
+    client = pymongo.MongoClient(mongo_uri)
+    collection = client["rag_database"]["parent_documents"]
+    
+    # 3. Use your custom MongoDocStore
+    store = MongoDocStore(collection)
     # --- MODIFICATION END ---
 
     retriever = ParentDocumentRetriever(
@@ -54,10 +71,9 @@ def get_retriever(vectorstore, documents):
     )
 
     print("Adding documents to the retriever...")
-    retriever.add_documents(documents, ids=None)
+    retriever.add_documents(documents, ids=None) 
     print("Documents added successfully.")
     return retriever
-
 
 def get_embedding_model():
     """
@@ -67,7 +83,6 @@ def get_embedding_model():
         model_name="l3cube-pune/indic-sentence-similarity-sbert"
     )
     return embedding_model
-
 
 if __name__ == "__main__":
     print("Loading text documents...")
@@ -95,5 +110,4 @@ if __name__ == "__main__":
 
     print(f"Saving FAISS index to {DB_FAISS_PATH}...")
     retriever.vectorstore.save_local(DB_FAISS_PATH)
-    print(f"Parent docstore saved to {DOCSTORE_PATH}")
     print("✅ Vector database created and saved successfully.")
