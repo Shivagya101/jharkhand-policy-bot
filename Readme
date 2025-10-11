@@ -1,0 +1,34 @@
+python -m venv venv
+
+source venv/Scripts/activate
+
+pip install -r requirements.txt
+
+# Make sure to freeze the packages before you commit
+pip freeze > requirements.txt
+
+
+
+✅ Update your local main before starting work
+# Make sure you're on main
+git checkout main
+
+# Fetch the latest changes from the remote
+git fetch origin
+
+# Update your local main with the remote main
+git pull origin main
+
+✅ Keep your feature branch in sync with main
+
+If you’re already working on a feature branch (e.g. Devdutt):
+
+# Switch to your branch
+git checkout Devdutt
+
+# Rebase your work on top of the latest main (recommended)
+git pull --rebase origin main
+
+
+# how to run the http server 
+uvicorn main:app --reload
