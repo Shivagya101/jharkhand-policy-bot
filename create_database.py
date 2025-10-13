@@ -2,7 +2,7 @@ import os
 import pymongo
 from dotenv import load_dotenv
 from mongo_docstore import MongoDocStore
-
+from langchain_cohere import CohereEmbeddings
 
 load_dotenv()
 
@@ -17,13 +17,14 @@ from langchain_community.docstore.in_memory import InMemoryDocstore
 import faiss # Use the direct faiss import
 
 
+
 # --- NEW IMPORT: The key to solving the error ---
 from langchain.storage import create_kv_docstore
 
 # --- Paths ---
 DATA_PATH = "data/"
 DB_FAISS_PATH = "vector_store/db_faiss"
-DOCSTORE_PATH = "vector_store/parent_store"
+# DOCSTORE_PATH = "vector_store/parent_store"
 
 def load_text_files(data_path):
     """
@@ -76,13 +77,18 @@ def get_retriever(vectorstore, documents):
     return retriever
 
 def get_embedding_model():
-    """
-    Initializes the HuggingFace embedding model (Hindi + English support).
-    """
-    embedding_model = HuggingFaceEmbeddings(
-        model_name="l3cube-pune/indic-sentence-similarity-sbert"
+    """Initializes the Cohere embedding model."""
+    cohere_api_key = os.getenv("COHERE_API_KEY")
+    if not cohere_api_key:
+        raise ValueError("COHERE_API_KEY not found in environment variables.")
+    
+    # Use a standard, powerful Cohere embedding model
+    embedding_model = CohereEmbeddings(
+        model="embed-multilingual-v3.0", 
+        cohere_api_key=cohere_api_key
     )
     return embedding_model
+
 
 if __name__ == "__main__":
     print("Loading text documents...")

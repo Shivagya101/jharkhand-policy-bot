@@ -1,4 +1,6 @@
 import os
+import pymongo 
+
 # If you keep credentials in a .env file, try to load them into the environment at runtime.
 try:
     # python-dotenv is listed in requirements.txt; this import is optional in environments where
@@ -15,6 +17,8 @@ except Exception:
     # read variables from the actual environment.
     print("python-dotenv not available; relying on environment variables")
     pass
+
+from langchain_cohere import ChatCohere, CohereEmbeddings
 from langchain.storage import create_kv_docstore
 from typing import List, TypedDict, Annotated, Sequence
 from langchain_huggingface import HuggingFaceEndpoint, HuggingFaceEmbeddings, ChatHuggingFace
@@ -28,6 +32,8 @@ from langchain.storage import LocalFileStore
 from langchain.storage._lc_store import create_lc_store
 from langchain.retrievers import ParentDocumentRetriever
 from langchain.text_splitter import RecursiveCharacterTextSplitter
+
+from mongo_docstore import MongoDocStore
 
 
 # Global counter for how many times the LLM is called.
@@ -45,49 +51,66 @@ def invoke_chain(chain, payload: dict):
     return resp
 
 # --- Configuration (No changes here) ---
-HF_TOKEN = os.environ.get("HUGGINGFACEHUB_API_TOKEN") or os.environ.get("HF_TOKEN")
-REPO_ID = "Qwen/Qwen2-7B-Instruct"
+# HF_TOKEN = os.environ.get("HUGGINGFACEHUB_API_TOKEN") or os.environ.get("HF_TOKEN")
+# REPO_ID = "Qwen/Qwen2-7B-Instruct"
+
+COHERE_API_KEY = os.environ.get("COHERE_API_KEY")
 DB_FAISS_PATH = "vector_store/db_faiss"
-EMBED_MODEL = "l3cube-pune/indic-sentence-similarity-sbert"
+# EMBED_MODEL = "l3cube-pune/indic-sentence-similarity-sbert"
 # --- IMPORTANT: Add the path to your PDF data for the retriever setup ---
 DATA_PATH = "data/" 
 
 # --- LLM and Retriever Setup (Reused and adapted from previous scripts) ---
 
-def load_chat_model() -> ChatHuggingFace:
-    if not HF_TOKEN:
-        raise RuntimeError("Set HUGGINGFACEHUB_API_TOKEN or HF_TOKEN in your environment.")
-    endpoint = HuggingFaceEndpoint(
-        repo_id=REPO_ID,
-        huggingfacehub_api_token=HF_TOKEN,
-        task="conversational",
-        temperature=0.1, # Lower temperature for more deterministic grading/rewriting
-        max_new_tokens=512,
+def load_chat_model() -> ChatCohere: # CHANGED: Type hint to ChatCohere
+    """
+    Loads the Cohere chat model.
+    """
+    if not COHERE_API_KEY:
+        raise RuntimeError("Set COHERE_API_KEY in your environment.")
+    
+    # CHANGED: Instantiate ChatCohere instead of HuggingFaceEndpoint
+    # Using 'command-s' as a powerful and balanced model choice.
+    model = ChatCohere(
+        model="command-a-03-2025", 
+        cohere_api_key=COHERE_API_KEY,
+        temperature=0.1 # Lower temperature for more deterministic grading/rewriting
     )
-    return ChatHuggingFace(llm=endpoint)
-# You'll need this new import at the top of your file
+    return model
+
 
 
 def get_retriever():
     """
-    Loads the FAISS vector store (child embeddings)
-    and the saved parent docstore to reconstruct the ParentDocumentRetriever.
+    Loads the FAISS vector store and connects to MongoDB to reconstruct
+    the ParentDocumentRetriever.
     """
-    # ✅ Step 1: Load your embedding model
-    embeddings = HuggingFaceEmbeddings(model_name=EMBED_MODEL)
+    # Step 1: Load the SAME Cohere embedding model used for creation
+    print("Loading Cohere embedding model...")
+    cohere_api_key = os.getenv("COHERE_API_KEY")
+    if not cohere_api_key:
+        raise ValueError("COHERE_API_KEY not found in environment variables.")
+    embeddings = CohereEmbeddings(model="embed-english-v3.0", cohere_api_key=cohere_api_key)
 
-    # ✅ Step 2: Load FAISS index (child embeddings)
+    # Step 2: Load FAISS index (child embeddings)
+    print("Loading FAISS vector store...")
     db = FAISS.load_local(DB_FAISS_PATH, embeddings, allow_dangerous_deserialization=True)
 
-    # ✅ Step 3: Load saved parent docstore (created in create_database.py)
-    DOCSTORE_PATH = "vector_store/parent_store"
-    fs = LocalFileStore(DOCSTORE_PATH)
-    store = create_lc_store(fs)
+    # Step 3: Connect to MongoDB for the parent docstore
+    print("Connecting to MongoDB for parent documents...")
+    mongo_uri = os.getenv("MONGO_DB_URI")
+    if not mongo_uri:
+        raise ValueError("MONGO_DB_URI not found in environment variables.")
+    
+    client = pymongo.MongoClient(mongo_uri)
+    collection = client["rag_database"]["parent_documents"]
+    store = MongoDocStore(collection)
 
-    # ✅ Step 4: Use the same splitters as used during database creation
+    # Step 4: Use the same splitters as during creation
     parent_splitter = RecursiveCharacterTextSplitter(chunk_size=1500, chunk_overlap=70)
     child_splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=40)
-    # ✅ Step 5: Rebuild the ParentDocumentRetriever
+    
+    # Step 5: Rebuild the ParentDocumentRetriever
     retriever = ParentDocumentRetriever(
         vectorstore=db,
         docstore=store,
@@ -95,8 +118,9 @@ def get_retriever():
         child_splitter=child_splitter,
     )
 
-    print("Retriever loaded successfully.")
+    print("✅ Retriever loaded successfully with MongoDB docstore.")
     return retriever
+
 
 # 1. Define the State
 # The state is the "memory" of our agent. It's a dictionary that gets passed between nodes.
@@ -135,6 +159,7 @@ def grade_documents(state):
     print("---NODE: GRADE DOCUMENTS---")
     question = state["question"]
     documents = state["documents"]
+    iterations = state.get("iterations", 0) + 1
     
     # Simple grading prompt that returns 'yes' or 'no' in plain text
     grade_prompt = PromptTemplate(
@@ -167,7 +192,7 @@ def grade_documents(state):
             print("---GRADE: DOCUMENT NOT RELEVANT---")
             continue
     
-    return {"documents": filtered_docs}
+    return {"documents": filtered_docs, "iterations": iterations}
 
 def generate(state):
     """
@@ -242,7 +267,12 @@ def summarize_map(state):
     summarizer_chain = summarizer_prompt | llm
 
     # Summarize each document in parallel (or sequentially)
-    summaries = [getattr(invoke_chain(summarizer_chain, {"question": question, "document": doc.page_content}), "content", str(invoke_chain(summarizer_chain, {"question": question, "document": doc.page_content}))) for doc in documents]
+    summaries = []
+    for doc in documents:
+        # ✅ Call the LLM only ONCE per document
+        result = invoke_chain(summarizer_chain, {"question": question, "document": doc.page_content})
+        summary_text = getattr(result, "content", str(result))
+        summaries.append(summary_text)
     
     # Create new Document objects from the summaries
     summary_docs = [
