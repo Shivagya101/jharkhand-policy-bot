@@ -90,7 +90,7 @@ def get_retriever():
     cohere_api_key = os.getenv("COHERE_API_KEY")
     if not cohere_api_key:
         raise ValueError("COHERE_API_KEY not found in environment variables.")
-    embeddings = CohereEmbeddings(model="embed-english-v3.0", cohere_api_key=cohere_api_key)
+    embeddings = CohereEmbeddings(model="embed-multilingual-v3.0", cohere_api_key=cohere_api_key)
 
     # Step 2: Load FAISS index (child embeddings)
     print("Loading FAISS vector store...")
@@ -107,8 +107,8 @@ def get_retriever():
     store = MongoDocStore(collection)
 
     # Step 4: Use the same splitters as during creation
-    parent_splitter = RecursiveCharacterTextSplitter(chunk_size=1500, chunk_overlap=70)
-    child_splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=40)
+    parent_splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=70)
+    child_splitter = RecursiveCharacterTextSplitter(chunk_size=100, chunk_overlap=40)
     
     # Step 5: Rebuild the ParentDocumentRetriever
     retriever = ParentDocumentRetriever(

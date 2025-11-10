@@ -47,8 +47,8 @@ def get_retriever(vectorstore, documents):
     Initializes the ParentDocumentRetriever with MongoDB as the docstore,
     using a connection URI from the environment file.
     """
-    parent_splitter = RecursiveCharacterTextSplitter(chunk_size=1500, chunk_overlap=70)
-    child_splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=40)
+    parent_splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=70)
+    child_splitter = RecursiveCharacterTextSplitter(chunk_size=100, chunk_overlap=40)
 
     # --- MODIFICATION START ---
     # 1. Get the MongoDB URI from environment variables
