@@ -362,6 +362,7 @@ app = workflow.compile()
 
 # --- Run the Chatbot ---
 if __name__ == "__main__":
+    app = workflow.compile()
     query = input("Enter your query: ").strip()
     if not query:
         raise SystemExit("Empty query. Exiting.")
