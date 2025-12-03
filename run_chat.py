@@ -1,5 +1,7 @@
 import os
-import pymongo 
+import pymongo
+import time
+from langchain_pinecone import PineconeVectorStore
 
 # If you keep credentials in a .env file, try to load them into the environment at runtime.
 try:
@@ -38,14 +40,19 @@ from mongo_docstore import MongoDocStore
 
 # Global counter for how many times the LLM is called.
 llm_call_count = 0
+# Rate limiting for Cohere Trial key (10 calls/minute = 0.6 seconds min between calls)
+RATE_LIMIT_DELAY = 0.7  # seconds between API calls
 
 
 def invoke_chain(chain, payload: dict):
     """Invoke a chain/llm and increment the global llm_call_count.
 
     Returns the raw response from chain.invoke(payload).
+    Adds delay to respect Cohere Trial rate limit.
     """
     global llm_call_count
+    # Add delay to respect rate limit (Cohere Trial: 10 calls/minute)
+    time.sleep(RATE_LIMIT_DELAY)
     resp = chain.invoke(payload)
     llm_call_count += 1
     return resp
@@ -78,49 +85,47 @@ def load_chat_model() -> ChatCohere: # CHANGED: Type hint to ChatCohere
     )
     return model
 
-
-
 def get_retriever():
     """
-    Loads the FAISS vector store and connects to MongoDB to reconstruct
-    the ParentDocumentRetriever.
+    Connects to Pinecone and MongoDB to reconstruct the ParentDocumentRetriever.
     """
-    # Step 1: Load the SAME Cohere embedding model used for creation
+    # 1. Load Embeddings
     print("Loading Cohere embedding model...")
     cohere_api_key = os.getenv("COHERE_API_KEY")
-    if not cohere_api_key:
-        raise ValueError("COHERE_API_KEY not found in environment variables.")
     embeddings = CohereEmbeddings(model="embed-multilingual-v3.0", cohere_api_key=cohere_api_key)
 
-    # Step 2: Load FAISS index (child embeddings)
-    print("Loading FAISS vector store...")
-    db = FAISS.load_local(DB_FAISS_PATH, embeddings, allow_dangerous_deserialization=True)
+    # 2. Connect to Pinecone
+    print("Connecting to Pinecone...")
+    # pinecone_api_key = os.getenv("PINECONE_API_KEY") # No longer needed here
+    index_name = "jharkhand-policy-rag"
+    
+    # FIX: Remove the pinecone_api_key argument
+    vectorstore = PineconeVectorStore.from_existing_index(
+        index_name=index_name,
+        embedding=embeddings
+    )
 
-    # Step 3: Connect to MongoDB for the parent docstore
+    # 3. Connect to MongoDB 
     print("Connecting to MongoDB for parent documents...")
     mongo_uri = os.getenv("MONGO_DB_URI")
-    if not mongo_uri:
-        raise ValueError("MONGO_DB_URI not found in environment variables.")
-    
     client = pymongo.MongoClient(mongo_uri)
     collection = client["rag_database"]["parent_documents"]
     store = MongoDocStore(collection)
 
-    # Step 4: Use the same splitters as during creation
-    parent_splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=70)
-    child_splitter = RecursiveCharacterTextSplitter(chunk_size=100, chunk_overlap=40)
+    # 4. Splitters
+    parent_splitter = RecursiveCharacterTextSplitter(chunk_size=8000, chunk_overlap=500)
+    child_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=100)
     
-    # Step 5: Rebuild the ParentDocumentRetriever
+    # 5. Rebuild Retriever
     retriever = ParentDocumentRetriever(
-        vectorstore=db,
+        vectorstore=vectorstore,
         docstore=store,
         parent_splitter=parent_splitter,
         child_splitter=child_splitter,
     )
 
-    print("✅ Retriever loaded successfully with MongoDB docstore.")
+    print("✅ Retriever connected (Pinecone + MongoDB).")
     return retriever
-
 
 # 1. Define the State
 # The state is the "memory" of our agent. It's a dictionary that gets passed between nodes.
@@ -142,24 +147,35 @@ def retrieve(state):
     question = state["question"]
     # Support multiple retriever APIs (langchain has several: get_relevant_documents, retrieve, etc.)
     try:
-        documents = retriever.get_relevant_documents(question)
+        documents = retriever.invoke(
+            question, 
+            config={"configurable": {"search_kwargs": {"k": 8}}}
+        )
     except AttributeError:
-        try:
-            documents = retriever.retrieve(question)
-        except AttributeError:
-            # Fallback: if the retriever implements an invoke-style API used by the graph
-            documents = retriever.invoke(question)
+        retriever.vectorstore.search_kwargs = {"k": 8}
+        documents = retriever.invoke(question)
     return {"documents": documents, "question": question}
 
 def grade_documents(state):
     """
     Determines whether the retrieved documents are relevant to the question.
     This is our "critic" node.
+    OPTIMIZED: Only grade top-3 documents to reduce API calls (Trial key has 10 calls/min limit)
     """
     print("---NODE: GRADE DOCUMENTS---")
     question = state["question"]
     documents = state["documents"]
     iterations = state.get("iterations", 0) + 1
+    
+    # OPTIMIZATION: Only grade top 3 documents instead of all
+    # FAISS already ranked by relevance, so top results are usually good
+    top_k_to_grade = min(5, len(documents))
+    docs_to_grade = documents[:top_k_to_grade]
+    
+    # If we retrieved very few docs, keep them all
+    if len(documents) <= 2:
+        print(f"---KEEPING ALL {len(documents)} DOCUMENTS (too few to filter)---")
+        return {"documents": documents, "iterations": iterations}
     
     # Simple grading prompt that returns 'yes' or 'no' in plain text
     grade_prompt = PromptTemplate(
@@ -176,7 +192,8 @@ def grade_documents(state):
     chain = grade_prompt | llm
     
     filtered_docs = []
-    for d in documents:
+    for i, d in enumerate(docs_to_grade):
+        print(f"Grading doc {i+1}/{top_k_to_grade}...")
         resp = invoke_chain(chain, {"question": question, "document": d.page_content})
         print(f"Grading response: {getattr(resp, 'content', str(resp))}")
         # The LLM returns text; normalize and check for 'yes' or 'no'
@@ -190,48 +207,62 @@ def grade_documents(state):
             filtered_docs.append(d)
         else:
             print("---GRADE: DOCUMENT NOT RELEVANT---")
-            continue
+    
+    # If all graded docs were rejected, keep the top 1 to ensure we have something
+    if not filtered_docs and docs_to_grade:
+        print("---ALL GRADED DOCS REJECTED, KEEPING TOP 1---")
+        filtered_docs = [docs_to_grade[0]]
     
     return {"documents": filtered_docs, "iterations": iterations}
 
 def generate(state):
     """
-    Generate an answer using the retrieved documents.
+    Generate a detailed answer using the retrieved documents.
     """
     print("---NODE: GENERATE---")
     question = state["question"]
     documents = state["documents"]
-    print(documents)
+    
+    # Format documents into readable context
+    formatted_context = "\n---\n".join(
+        [f"Document {i+1}:\n{doc.page_content}" for i, doc in enumerate(documents)]
+    )
+    
     prompt = PromptTemplate(
         template=CUSTOM_PROMPT, input_variables=["context", "question"]
     )
     
     rag_chain = prompt | llm
-    generation = invoke_chain(rag_chain, {"context": documents, "question": question})
+    generation = invoke_chain(rag_chain, {"context": formatted_context, "question": question})
     # Ensure we return the text content when available
     return {"generation": getattr(generation, "content", str(generation))}
 
 def rewrite_query(state):
     """
-    Transform the query to produce a better question.
+    Transform the query to produce a better question for document retrieval.
     """
     print("---NODE: REWRITE QUERY---")
     question = state["question"]
     
-    # Prompt
-    system = """You are a query re-writer. Given a user question, your task is to rephrase it to be more
-    aligned with the language and terminology found in legal and policy documents.
-    Do not answer the question, only rewrite it."""
-    
+    # More effective rewriting prompt
     rewrite_prompt = PromptTemplate(
-        template="Original question: {question}",
+        template=(
+            "You are an expert at reformulating user questions to better match government policy documents.\n\n"
+            "Rewrite the following question to:\n"
+            "1. Use official terminology (e.g., 'scheme', 'eligibility', 'benefits', 'implementation')\n"
+            "2. Add relevant keywords that might appear in policy documents\n"
+            "3. If it's about a specific policy, try to identify what type it is\n\n"
+            "Original question: {question}\n\n"
+            "Rewritten question:"
+        ),
         input_variables=["question"],
     )
     
     rewriter_chain = rewrite_prompt | llm
     rewritten_question = invoke_chain(rewriter_chain, {"question": question})
-    print(f"Rewritten question: {getattr(rewritten_question, 'content', str(rewritten_question))}")
-    return {"question": getattr(rewritten_question, "content", str(rewritten_question))}
+    rewritten_text = getattr(rewritten_question, "content", str(rewritten_question)).strip()
+    print(f"Rewritten question: {rewritten_text}")
+    return {"question": rewritten_text}
 
 def check_context_size(state):
     """
@@ -316,11 +347,25 @@ def decide_context_path(state):
 # Initialize LLM and Retriever globally for the graph nodes
 llm = load_chat_model()
 retriever = get_retriever()
-CUSTOM_PROMPT = """Use ONLY the information in the context to answer the user's question. If the answer is not in the context, say you don't know. Do not make anything up.
+CUSTOM_PROMPT = """You are an expert on Jharkhand Government policies and schemes. Use the provided context to answer the user's question comprehensively.
 
-Context: {context}
-Question: {question}
-Answer:"""
+Context:
+{context}
+
+User Question: {question}
+
+Instructions:
+1. Answer based ONLY on the information provided in the context above
+2. If multiple policies/schemes are mentioned, explain each one separately with details like:
+   - Name and purpose
+   - Key benefits
+   - Eligibility criteria
+   - Implementation process
+3. Be detailed and thorough - provide specific information, not just general statements
+4. If the answer is not in the context, clearly state "This information is not available in the provided documents"
+5. Use structured formatting (bullet points, numbered lists) for clarity
+
+Detailed Answer:"""
 
 workflow = StateGraph(GraphState)
 
