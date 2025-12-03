@@ -20,20 +20,28 @@ except Exception:
     print("python-dotenv not available; relying on environment variables")
     pass
 
-from langchain_cohere import ChatCohere, CohereEmbeddings
-from langchain.storage import create_kv_docstore
 from typing import List, TypedDict, Annotated, Sequence
-from langchain_huggingface import HuggingFaceEndpoint, HuggingFaceEmbeddings, ChatHuggingFace
 from langchain_core.prompts import PromptTemplate
-from langchain_community.vectorstores import FAISS
 from langchain_core.documents import Document
-from langchain_core.pydantic_v1 import BaseModel, Field
-from langgraph.graph import StateGraph, END
-import operator
-from langchain.storage import LocalFileStore
-from langchain.storage._lc_store import create_lc_store
+# UPDATED: Use standard pydantic instead of pydantic_v1
+from pydantic import BaseModel, Field 
+
+# --- 2. AI Models (Cohere) ---
+from langchain_cohere import ChatCohere, CohereEmbeddings
+
+# --- 3. Vector Store (Pinecone) ---
+# REPLACED: FAISS with PineconeVectorStore
+from langchain_pinecone import PineconeVectorStore
+
+# --- 4. Retrieval & Splitting ---
 from langchain.retrievers import ParentDocumentRetriever
 from langchain.text_splitter import RecursiveCharacterTextSplitter
+
+# --- 5. LangGraph ---
+from langgraph.graph import StateGraph, END
+
+# --- 6. Custom Modules ---
+from mongo_docstore import MongoDocStore
 
 from mongo_docstore import MongoDocStore
 
